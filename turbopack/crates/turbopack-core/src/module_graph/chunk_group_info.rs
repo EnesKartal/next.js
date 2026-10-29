@@ -106,11 +106,23 @@ impl ChunkGroupInfo {
         Ok(Vc::cell(
             groups
                 .iter()
-                .map(|index| ChunkGroupWithIndex {
-                    index,
-                    chunk_group: self.chunk_groups[index as usize].clone(),
+                .map(|index| {
+                    // `module_chunk_groups` is a separate cell and can be eventually inconsistent
+                    // with `chunk_groups`, so the index may be out of range.
+                    let chunk_group = self
+                        .chunk_groups
+                        .get_index(index as usize)
+                        .with_context(|| {
+                            format!(
+                                "chunk group {index} of a module is not a known chunk group ({} \
+                                 chunk groups)",
+                                self.chunk_groups.len()
+                            )
+                        })?
+                        .clone();
+                    Ok(ChunkGroupWithIndex { index, chunk_group })
                 })
-                .collect(),
+                .collect::<Result<_>>()?,
         ))
     }
 
@@ -141,6 +153,18 @@ impl ChunkGroupInfo {
 }
 
 impl ChunkGroupInfo {
+    /// Returns the parent chunk group of a merged chunk group. The index can be out of range when
+    /// the data is eventually inconsistent, so this is an error, not a panic.
+    fn merged_parent(&self, parent: usize) -> Result<&ChunkGroup> {
+        self.chunk_groups.get_index(parent).with_context(|| {
+            format!(
+                "parent chunk group {parent} of a merged chunk group is not a known chunk group \
+                 ({} chunk groups)",
+                self.chunk_groups.len()
+            )
+        })
+    }
+
     /// Returns the index of the chunk group identified by `key` in
     /// [`ChunkGroupInfo::chunk_groups`].
     ///
@@ -178,7 +202,19 @@ impl ChunkGroupInfo {
     /// the entries of a merged group) always come from the module graph rather than the caller.
     pub async fn get_chunk_group(self: Vc<Self>, key: ChunkGroupKey) -> Result<ChunkGroup> {
         let index = self.get_index_of(key).await?;
-        Ok(self.await?.chunk_groups[index].clone())
+        // The index comes from the keyed `chunk_group_indices` cell, which can be eventually
+        // inconsistent with `chunk_groups`.
+        let this = self.await?;
+        Ok(this
+            .chunk_groups
+            .get_index(index)
+            .with_context(|| {
+                format!(
+                    "chunk group index {index} is out of range ({} chunk groups)",
+                    this.chunk_groups.len()
+                )
+            })?
+            .clone())
     }
 }
 
@@ -381,8 +417,12 @@ impl ChunkGroup {
             } => {
                 format!(
                     "ChunkGroup::IsolatedMerged({}, {}, {:?})",
-                    Box::pin(chunk_group_info.chunk_groups[*parent].debug_str(chunk_group_info))
-                        .await?,
+                    Box::pin(
+                        chunk_group_info
+                            .merged_parent(*parent)?
+                            .debug_str(chunk_group_info)
+                    )
+                    .await?,
                     merge_tag,
                     entries
                         .iter()
@@ -398,8 +438,12 @@ impl ChunkGroup {
             } => {
                 format!(
                     "ChunkGroup::SharedMerged({}, {}, {:?})",
-                    Box::pin(chunk_group_info.chunk_groups[*parent].debug_str(chunk_group_info))
-                        .await?,
+                    Box::pin(
+                        chunk_group_info
+                            .merged_parent(*parent)?
+                            .debug_str(chunk_group_info)
+                    )
+                    .await?,
                     merge_tag,
                     entries
                         .iter()
@@ -445,10 +489,7 @@ impl ChunkGroupKey {
     /// names from this, so two chunk groups must render equally exactly when they are the same
     /// chunk group. Changing the rendering renames assets; adding anything graph-local to it is a
     /// correctness bug.
-    pub async fn ident_str(
-        &self,
-        keys: &(impl std::ops::Index<usize, Output = Self> + ?Sized),
-    ) -> Result<String> {
+    pub async fn ident_str(&self, keys: &FxIndexSet<ChunkGroupKey>) -> Result<String> {
         Ok(match self {
             ChunkGroupKey::Entry(entries) => format!(
                 "Entry({:?})",
@@ -470,7 +511,7 @@ impl ChunkGroupKey {
             ChunkGroupKey::IsolatedMerged { parent, merge_tag } => {
                 format!(
                     "IsolatedMerged {{ parent: {}, merge_tag: {:?} }}",
-                    Box::pin(keys.index(parent.0 as usize).ident_str(keys)).await?,
+                    Box::pin(merged_parent_key(keys, *parent)?.ident_str(keys)).await?,
                     merge_tag
                 )
             }
@@ -488,7 +529,7 @@ impl ChunkGroupKey {
             ChunkGroupKey::SharedMerged { parent, merge_tag } => {
                 format!(
                     "SharedMerged {{ parent: {}, merge_tag: {:?} }}",
-                    Box::pin(keys.index(parent.0 as usize).ident_str(keys)).await?,
+                    Box::pin(merged_parent_key(keys, *parent)?.ident_str(keys)).await?,
                     merge_tag
                 )
             }
@@ -500,12 +541,25 @@ impl ChunkGroupKey {
     /// Delegates to [`Self::ident_str`], which already renders the chunk group unambiguously.
     /// Debug output is free to diverge from it, but note that `ident_str` must stay stable because
     /// asset idents are derived from it -- change this wrapper rather than `ident_str` itself.
-    pub async fn debug_str(
-        &self,
-        keys: &(impl std::ops::Index<usize, Output = Self> + ?Sized),
-    ) -> Result<String> {
+    pub async fn debug_str(&self, keys: &FxIndexSet<ChunkGroupKey>) -> Result<String> {
         self.ident_str(keys).await
     }
+}
+
+/// Looks up the key of a merged chunk group's `parent`. The index can be out of range when `keys`
+/// is eventually inconsistent with the key referring to it, so this is an error, not a panic.
+fn merged_parent_key(
+    keys: &FxIndexSet<ChunkGroupKey>,
+    parent: ChunkGroupId,
+) -> Result<&ChunkGroupKey> {
+    keys.get_index(parent.0 as usize).with_context(|| {
+        format!(
+            "parent chunk group {} of a merged chunk group is not a known chunk group ({} chunk \
+             groups)",
+            parent.0,
+            keys.len()
+        )
+    })
 }
 
 #[turbo_tasks::task_input]
@@ -866,13 +920,15 @@ pub async fn compute_chunk_group_info(graph: &ModuleGraph) -> Result<Vc<ChunkGro
                 }
             }
 
+            let chunk_group_keys: FxIndexSet<ChunkGroupKey> =
+                chunk_groups_map.keys().cloned().collect();
             let mut result = vec![];
             result.push("Chunk Groups:".to_string());
             for (i, (key, _)) in chunk_groups_map.iter().enumerate() {
                 result.push(format!(
                     "  {:?}: {}",
                     i,
-                    key.debug_str(&chunk_groups_map.keys()).await?
+                    key.debug_str(&chunk_group_keys).await?
                 ));
             }
             result.push("# Module buckets:".to_string());
