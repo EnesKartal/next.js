@@ -2512,7 +2512,7 @@ impl NextConfig {
             NextMode::Build => self
                 .experimental
                 .turbopack_minify_before_chunking
-                .unwrap_or(false),
+                .unwrap_or(true),
         }))
     }
 
